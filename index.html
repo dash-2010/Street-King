@@ -614,6 +614,158 @@ const mpOtherPlayers=()=>{
     .map(([id,p])=>({id,...p}));
 };
 
+// ============================================================================
+// RAID SYSTEM — PvP attacks on other players' zones
+// ============================================================================
+// Raid types unlocked by crew composition. Each takes ~24h to resolve.
+// Defender can deploy crew to defend during the resolution window.
+
+const RAID_TYPES={
+  smash_grab:{
+    id:"smash_grab",name:"SMASH & GRAB",icon:"💥",
+    desc:"Direct muscle assault. Brawn over brain. Highest heat, fastest resolution.",
+    requires:["enforcer"], // any enforcer in hiredCrew
+    duration:1, // resolution in days
+    heatGenerated:25,
+    successFormula:"attacker_muscle * 1.0 vs defender_muscle * 1.2 (defender bonus from being entrenched)",
+    rewards:"Take the zone. Take 25% of defender's recent zone revenue.",
+    failPenalty:"Lose 30% of attack force's salary as injuries. Heat +25.",
+  },
+  surgical_strike:{
+    id:"surgical_strike",name:"SURGICAL STRIKE",icon:"🎯",
+    desc:"Coordinated hit with intel + brains. Lower heat, higher success vs unprepared targets.",
+    requires:["enforcer_elite","connect"], // tier check at runtime
+    duration:1,
+    heatGenerated:12,
+    successFormula:"attacker (muscle*0.7 + brain*1.0 + connect*0.8) vs defender_muscle",
+    rewards:"Take the zone. Take 40% of defender's recent zone revenue. Quiet — no rep loss for defender.",
+    failPenalty:"Heat +15. Defender learns who attacked them (rep -5 with them).",
+  },
+  hostile_takeover:{
+    id:"hostile_takeover",name:"HOSTILE TAKEOVER",icon:"👑",
+    desc:"Bishop coordinates a multi-front operation. Zone + stash + intel. Apex tier raid.",
+    requires:["negotiator","enforcer_elite"], // need Bishop + elite enforcer
+    duration:2,
+    heatGenerated:18,
+    successFormula:"attacker (muscle + brain + charm) * 1.1 vs defender (muscle + brain) * 1.3",
+    rewards:"Take the zone. Take 60% of defender's recent revenue. Take 30% of defender's stash.",
+    failPenalty:"Heat +20. Lose -10 rep (failed takeover signals weakness).",
+  },
+};
+
+// Calculate which raid types a player can launch
+const availableRaidTypes=(g)=>{
+  const hired=g.hiredCrew||[];
+  const hasEnforcer=hired.some(id=>{const c=CREW_ROSTER.find(c=>c.id===id);return c&&c.role==="Enforcer"});
+  const hasEliteEnforcer=hired.some(id=>{const c=CREW_ROSTER.find(c=>c.id===id);return c&&c.role==="Enforcer"&&c.tier==="Elite"});
+  const hasConnect=hired.some(id=>{const c=CREW_ROSTER.find(c=>c.id===id);return c&&c.role==="Connect"});
+  const hasNegotiator=hired.includes("negotiator");
+  const out=[];
+  if(hasEnforcer)out.push(RAID_TYPES.smash_grab);
+  if(hasEliteEnforcer&&hasConnect)out.push(RAID_TYPES.surgical_strike);
+  if(hasNegotiator&&hasEliteEnforcer)out.push(RAID_TYPES.hostile_takeover);
+  return out;
+};
+
+// Calculate attacker's combat power for a given raid type
+const raidAttackerPower=(g,raidType)=>{
+  const hired=(g.hiredCrew||[]).map(id=>CREW_ROSTER.find(c=>c.id===id)).filter(Boolean);
+  const skills=hired.reduce((s,c)=>({muscle:s.muscle+c.skills.muscle,brain:s.brain+c.skills.brain,charm:s.charm+c.skills.charm,connect:s.connect+c.skills.connect}),{muscle:0,brain:0,charm:0,connect:0});
+  if(raidType==="smash_grab")return skills.muscle*10;
+  if(raidType==="surgical_strike")return skills.muscle*7+skills.brain*10+skills.connect*8;
+  if(raidType==="hostile_takeover")return(skills.muscle+skills.brain+skills.charm)*11;
+  return 0;
+};
+
+// Calculate defender's combat power (from their published state)
+const raidDefenderPower=(playerData,raidType)=>{
+  // Estimate defender power from their game state — use rep + zones owned as proxy for crew strength
+  const baseDefense=(playerData.rep||10)*2+Object.keys(playerData.zones||{}).length*15;
+  if(raidType==="smash_grab")return baseDefense*1.2;
+  if(raidType==="surgical_strike")return baseDefense*1.0;
+  if(raidType==="hostile_takeover")return baseDefense*1.3;
+  return baseDefense;
+};
+
+// Launch a raid — pushes raid object to lobby's `raids` collection
+const mpLaunchRaid=async(raidType,targetPlayerId,targetCity,targetZone,attackerPower)=>{
+  if(!MP.enabled||!MP.lobbyCode||!MP.playerId)return{error:"Not in a lobby"};
+  const raidId=`raid_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+  const raid={
+    id:raidId,
+    type:raidType,
+    attacker:MP.playerId,
+    attackerHandle:MP.playerHandle,
+    defender:targetPlayerId,
+    city:targetCity,
+    zone:targetZone,
+    attackerPower,
+    defenderReinforcement:0,
+    startedAt:Date.now(),
+    resolvesAt:Date.now()+(RAID_TYPES[raidType].duration*10*60*1000), // 10 minutes real-time per "day" of duration — gives defender time to react without being tedious
+    status:"pending",
+  };
+  try{
+    await MP.db.collection("lobbies").doc(MP.lobbyCode).update({
+      [`raids.${raidId}`]:raid,
+      activityLog:window.firebase.firestore.FieldValue.arrayUnion({
+        ts:Date.now(),
+        msg:`${MP.playerHandle} launched a ${RAID_TYPES[raidType].name} on ${targetZone}`,
+        actor:MP.playerHandle,
+        type:"raid_launched",
+      }),
+    });
+    return{ok:true,raidId};
+  }catch(e){return{error:e.message}}
+};
+
+// Defender adds reinforcement power to an active raid
+const mpReinforceDefense=async(raidId,reinforcement)=>{
+  if(!MP.enabled||!MP.lobbyCode)return;
+  try{
+    await MP.db.collection("lobbies").doc(MP.lobbyCode).update({
+      [`raids.${raidId}.defenderReinforcement`]:window.firebase.firestore.FieldValue.increment(reinforcement),
+    });
+  }catch(e){console.warn("Reinforce failed:",e)}
+};
+
+// Resolve a raid (called when resolvesAt < now). Determines winner + applies effects locally.
+const mpResolveRaid=async(raid)=>{
+  if(!MP.enabled||!MP.lobbyCode||raid.status!=="pending")return null;
+  // Get defender's published power
+  const defender=MP.worldState?.players?.[raid.defender];
+  if(!defender)return{winner:"attacker",reason:"defender abandoned"};
+  let defPower=raidDefenderPower(defender,raid.type)+(raid.defenderReinforcement||0);
+  // Random factor ±15%
+  const attRoll=raid.attackerPower*(0.85+Math.random()*0.30);
+  const defRoll=defPower*(0.85+Math.random()*0.30);
+  const winner=attRoll>defRoll?"attacker":"defender";
+  try{
+    await MP.db.collection("lobbies").doc(MP.lobbyCode).update({
+      [`raids.${raid.id}.status`]:"resolved",
+      [`raids.${raid.id}.winner`]:winner,
+      [`raids.${raid.id}.resolvedAt`]:Date.now(),
+      [`raids.${raid.id}.attackerRoll`]:Math.round(attRoll),
+      [`raids.${raid.id}.defenderRoll`]:Math.round(defRoll),
+      activityLog:window.firebase.firestore.FieldValue.arrayUnion({
+        ts:Date.now(),
+        msg:winner==="attacker"
+          ?`${raid.attackerHandle} took ${raid.zone} from ${defender.handle}!`
+          :`${defender.handle} repelled ${raid.attackerHandle}'s raid on ${raid.zone}.`,
+        actor:winner==="attacker"?raid.attackerHandle:defender.handle,
+        type:"raid_resolved",
+      }),
+    });
+    // If attacker won, transfer zone ownership
+    if(winner==="attacker"){
+      await MP.db.collection("lobbies").doc(MP.lobbyCode).update({
+        [`zoneOwnership.${raid.city}.${raid.zone}`]:raid.attacker,
+      });
+    }
+    return{winner,attRoll,defRoll};
+  }catch(e){console.warn("Resolve failed:",e);return null}
+};
+
 // Persist lobby info to localStorage so it survives reload
 const mpSaveSession=()=>{
   if(MP.lobbyCode&&MP.playerId){
@@ -2708,7 +2860,7 @@ function ExpandableOption({opt,intel,selected,onClick}){
 }
 
 // REAL-WORLD INTERACTIVE MAP via Leaflet + dark-filtered OSM tiles
-function RegionMap({regionKey,zones,npcs,zoneStatuses,onZoneClick,onNpcClick,focusedZone,onUnfocus,g,onWhaleClick}){
+function RegionMap({regionKey,zones,npcs,zoneStatuses,onZoneClick,onNpcClick,focusedZone,onUnfocus,g,onWhaleClick,enemyZones,onEnemyZoneClick}){
   const containerRef=useRef(null);
   const mapRef=useRef(null);
   const layersRef=useRef([]);
@@ -2791,16 +2943,19 @@ function RegionMap({regionKey,zones,npcs,zoneStatuses,onZoneClick,onNpcClick,foc
     };
     zones.forEach(z=>{
       const zcfg=cfg.zones[z.id];if(!zcfg)return;
-      const status=zoneStatuses[z.id]||"neutral";
-      const c=palette[status]||palette.neutral;
+      // Enemy player owns this zone? Special handling
+      const enemy=enemyZones?.[z.id];
+      const status=enemy?"enemy":(zoneStatuses[z.id]||"neutral");
+      const c=enemy?{fill:"#FF3838",stroke:"#FF3838",op:0.18,wt:2}:(palette[status]||palette.neutral);
       const isFocused=focusedZone===z.id;
       const poly=window.L.polygon(zcfg.polygon,{
         color:c.stroke,fillColor:c.fill,fillOpacity:isFocused?Math.min(c.op*2,0.45):c.op,weight:isFocused?c.wt+1.5:c.wt,opacity:isFocused?1:0.85,
       }).addTo(map);
-      poly.on("click",()=>onZoneClick(z));
+      poly.on("click",()=>{enemy?onEnemyZoneClick&&onEnemyZoneClick(z,enemy):onZoneClick(z)});
       poly.on("mouseover",function(){this.setStyle({fillOpacity:Math.min(c.op*2.5,0.5),weight:c.wt+1.5})});
       poly.on("mouseout",function(){this.setStyle({fillOpacity:isFocused?Math.min(c.op*2,0.45):c.op,weight:isFocused?c.wt+1.5:c.wt})});
-      poly.bindTooltip(z.name.toUpperCase(),{permanent:true,direction:"center",className:"zone-tooltip "+status});
+      const tooltipText=enemy?`${z.name.toUpperCase()} · ⚔ ${enemy.handle.toUpperCase()}`:z.name.toUpperCase();
+      poly.bindTooltip(tooltipText,{permanent:true,direction:"center",className:"zone-tooltip "+status});
       layersRef.current.push(poly);
     });
     npcs.forEach(n=>{
@@ -2819,7 +2974,7 @@ function RegionMap({regionKey,zones,npcs,zoneStatuses,onZoneClick,onNpcClick,foc
       marker.bindTooltip(n.name+" · "+n.role,{direction:"top",offset:[0,-14]});
       layersRef.current.push(marker);
     });
-  },[regionKey,zones,npcs,zoneStatuses,onZoneClick,onNpcClick,focusedZone]);
+  },[regionKey,zones,npcs,zoneStatuses,onZoneClick,onNpcClick,focusedZone,enemyZones]);
 
   const focusedZoneObj=focusedZone?zones.find(z=>z.id===focusedZone):null;
 
@@ -3254,6 +3409,9 @@ function Game({initData,onReset,mpSession,onLeaveMp}){
 
   // Multiplayer state — populated from Firestore subscription
   const [mpWorld,setMpWorld]=useState(null);
+  const [raidTarget,setRaidTarget]=useState(null);  // {player, zone} when launching a raid
+  const [incomingRaid,setIncomingRaid]=useState(null);  // {raid} when being raided
+  const [acknowledgedRaids,setAcknowledgedRaids]=useState(new Set()); // raids we've already shown a modal for
 
   // Subscribe to lobby updates
   useEffect(()=>{
@@ -3261,6 +3419,78 @@ function Game({initData,onReset,mpSession,onLeaveMp}){
     mpSubscribe((world)=>{setMpWorld({...world})});
     return()=>{mpLeave()};
   },[mpSession?.lobbyCode]);
+
+  // RAID DETECTION — when mpWorld updates, check for incoming raids targeting us
+  useEffect(()=>{
+    if(!mpWorld||!mpSession)return;
+    const raids=mpWorld.raids||{};
+    // Find pending raids where we're the defender
+    const incoming=Object.values(raids).find(r=>
+      r.defender===MP.playerId&&
+      r.status==="pending"&&
+      !acknowledgedRaids.has(r.id)
+    );
+    if(incoming){
+      setIncomingRaid(incoming);
+      setAcknowledgedRaids(prev=>new Set([...prev,incoming.id]));
+    }
+    // RESOLUTION — check if any of our raids (attacker or defender) are due
+    const now=Date.now();
+    Object.values(raids).forEach(r=>{
+      if(r.status!=="pending")return;
+      if(r.resolvesAt>now)return;
+      // We're involved AND it's time to resolve
+      if(r.attacker===MP.playerId||r.defender===MP.playerId){
+        // Only the attacker triggers resolution to avoid double-resolves
+        if(r.attacker===MP.playerId){
+          mpResolveRaid(r).then(result=>{
+            if(!result)return;
+            const wonAsAttacker=result.winner==="attacker"&&r.attacker===MP.playerId;
+            const lostAsAttacker=result.winner==="defender"&&r.attacker===MP.playerId;
+            if(wonAsAttacker){
+              // Apply gains: take the zone
+              setG(p=>({
+                ...p,
+                zones:{...p.zones,[r.zone]:{takenDay:p.day,takenFrom:r.defender}},
+                rep:p.rep+5,
+                heat:Math.min(100,p.heat+RAID_TYPES[r.type].heatGenerated),
+                log:[{day:p.day,msg:`✓ RAID SUCCESS: Took ${r.zone} from ${mpWorld.players?.[r.defender]?.handle||"opponent"}. Rep +5. Heat +${RAID_TYPES[r.type].heatGenerated}.`,cls:"good"},...p.log].slice(0,80),
+              }));
+            }else if(lostAsAttacker){
+              setG(p=>({
+                ...p,
+                rep:Math.max(0,p.rep-3),
+                heat:Math.min(100,p.heat+RAID_TYPES[r.type].heatGenerated),
+                cash:Math.max(0,p.cash-Math.round(p.cash*0.05)),
+                log:[{day:p.day,msg:`✗ RAID FAILED: ${mpWorld.players?.[r.defender]?.handle||"target"} repelled your ${RAID_TYPES[r.type].name}. Rep -3. Heat +${RAID_TYPES[r.type].heatGenerated}.`,cls:"bad"},...p.log].slice(0,80),
+              }));
+            }
+          });
+        }else if(r.defender===MP.playerId&&result?.winner==="attacker"){
+          // We were defender and lost — happens via resolveRaid being called by attacker's client
+          // The zoneOwnership in firestore will be updated; we lose the zone locally too
+          setG(p=>{
+            const newZones={...p.zones};
+            delete newZones[r.zone];
+            return{...p,zones:newZones,rep:Math.max(0,p.rep-2),log:[{day:p.day,msg:`✗ LOST ${r.zone} to ${r.attackerHandle} in a raid. Rep -2.`,cls:"bad"},...p.log].slice(0,80)};
+          });
+        }
+      }
+    });
+  },[mpWorld,mpSession,acknowledgedRaids]);
+
+  // ENEMY ZONES — derive from mpWorld.zoneOwnership
+  const enemyZones=useMemo(()=>{
+    if(!mpWorld||!mpSession)return{};
+    const ownership=mpWorld.zoneOwnership?.[initData.cityKey]||{};
+    const out={};
+    Object.entries(ownership).forEach(([zoneId,playerId])=>{
+      if(playerId!==MP.playerId&&mpWorld.players?.[playerId]){
+        out[zoneId]={playerId,handle:mpWorld.players[playerId].handle};
+      }
+    });
+    return out;
+  },[mpWorld,mpSession,initData.cityKey]);
 
   const [g,setG]=useState(()=>{
     const saved=loadSave();
@@ -4650,7 +4880,7 @@ Use 0 for unchanged. Negative for losses. Cash deltas typically -50000 to +50000
           <>
             <h1 className="hdr">{city.name} · STREET MAP</h1>
             <div className="sub">CLICK A ZONE TO ZOOM IN AND READ THE DOSSIER · CLICK NPC PINS TO INTERACT · TYPE MOVES IN THE BAR BELOW</div>
-            <RegionMap regionKey={initData.cityKey} zones={region.zones} npcs={region.npcs} zoneStatuses={zoneStatuses} onZoneClick={(z)=>{setZone(z);setFocusedZone(z.id)}} onNpcClick={(n)=>setNpc(n)} focusedZone={focusedZone} onUnfocus={()=>setFocusedZone(null)} g={g} onWhaleClick={(cl)=>setSelClient(cl)}/>
+            <RegionMap regionKey={initData.cityKey} zones={region.zones} npcs={region.npcs} zoneStatuses={zoneStatuses} onZoneClick={(z)=>{setZone(z);setFocusedZone(z.id)}} onNpcClick={(n)=>setNpc(n)} focusedZone={focusedZone} onUnfocus={()=>setFocusedZone(null)} g={g} onWhaleClick={(cl)=>setSelClient(cl)} enemyZones={enemyZones} onEnemyZoneClick={(z,enemy)=>{const player=mpWorld?.players?.[enemy.playerId];if(player)setRaidTarget({player:{id:enemy.playerId,...player},zone:z.id})}}/>
           </>
         )}
         {tab==="people"&&<PeoplePage g={g} region={region} onCrewClick={(c)=>setSelCrew(c)} onNpcClick={(n)=>setNpc(n)} onClientClick={(cl)=>setSelClient(cl)} onClaimZone={claimZoneDirect}/>}
@@ -5064,6 +5294,8 @@ Use 0 for unchanged. Negative for losses. Cash deltas typically -50000 to +50000
       {poachOffer&&<PoachOfferModal client={poachOffer.client} poach={poachOffer.poach} onResolve={resolvePoach} onCancel={()=>setPoachOffer(null)}/>}
       {supplierDeal&&<SupplierNegotiationModal product={supplierDeal.product} baseCost={supplierDeal.baseCost} marketValue={supplierDeal.marketValue} playerCash={g.cash} stashRemaining={Math.max(0,stashCapFor(g.transport)-totalStash(g))} onConfirm={closeSupplierDeal} onCancel={()=>setSupplierDeal(null)}/>}
       {g.pendingRaid&&<CopRaidModal raid={g.pendingRaid} gameState={g} onResolve={(changes)=>setG(p=>({...p,...changes}))}/>}
+      {raidTarget&&<RaidLaunchModal target={raidTarget.player} zone={raidTarget.zone} city={initData.cityKey} gameState={g} onResolve={(result)=>{setG(p=>({...p,heat:Math.min(100,p.heat+result.heat),log:[{day:p.day,msg:`⚔ Launched ${RAID_TYPES[result.type].name} on ${raidTarget.player.handle}. Heat +${result.heat}.`,cls:"warn"},...p.log].slice(0,80)}));setRaidTarget(null)}} onCancel={()=>setRaidTarget(null)}/>}
+      {incomingRaid&&<IncomingRaidModal raid={incomingRaid} gameState={g} onDefend={(cost,bonus)=>{setG(p=>({...p,cash:p.cash-cost,log:[{day:p.day,msg:`💪 Reinforced defense for ${incomingRaid.zone}: -$${fmt(cost)}, +${bonus} defense power.`,cls:"good"},...p.log].slice(0,80)}));mpReinforceDefense(incomingRaid.id,bonus);setIncomingRaid(null)}} onSurrender={()=>setIncomingRaid(null)}/>}
       {speakClient&&<SpeakClientModal client={speakClient} gameState={g} onClose={()=>setSpeakClient(null)} onResolve={(cl,outcome)=>{
         if(outcome.type==="reject")return;
         setG(p=>{
@@ -7625,6 +7857,141 @@ class ErrorBoundary extends React.Component{
 }
 
 // ─── APP ROOT ───────────────────────────────────────────────────────────────
+function RaidLaunchModal({target,zone,city,gameState,onResolve,onCancel}){
+  // target = {id, handle, ...} other player
+  const available=availableRaidTypes(gameState);
+  const [chosen,setChosen]=useState(null);
+  const [submitting,setSubmitting]=useState(false);
+
+  const launch=async(raidType)=>{
+    setSubmitting(true);
+    const power=raidAttackerPower(gameState,raidType);
+    const result=await mpLaunchRaid(raidType,target.id,city,zone,power);
+    if(result.ok){
+      onResolve({type:raidType,heat:RAID_TYPES[raidType].heatGenerated});
+    }else{
+      alert("Raid failed: "+result.error);
+      setSubmitting(false);
+    }
+  };
+
+  if(available.length===0){
+    return(
+      <div className="ov">
+        <div className="modal" style={{maxWidth:480}}>
+          <div className="modal-hdr" style={{borderColor:"var(--amber)"}}>
+            <div>
+              <div className="modal-tag" style={{color:"var(--amber)",borderColor:"var(--amber)"}}>NO RAID OPTIONS</div>
+              <div className="modal-title">CREW NOT READY</div>
+            </div>
+          </div>
+          <div className="modal-body">
+            <p style={{fontSize:13,color:"var(--txt-dim)",lineHeight:1.7,marginBottom:14}}>You don't have the crew to launch a raid yet. Hire crew to unlock raid types:</p>
+            <ul style={{fontSize:12,color:"var(--txt-dim)",lineHeight:1.8,paddingLeft:20}}>
+              <li>Any <b style={{color:"var(--amber)"}}>Enforcer</b> → unlocks <b>SMASH & GRAB</b></li>
+              <li><b style={{color:"var(--amber)"}}>Elite Enforcer + Connect</b> → unlocks <b>SURGICAL STRIKE</b></li>
+              <li><b style={{color:"var(--amber)"}}>Bishop (Negotiator) + Elite Enforcer</b> → unlocks <b>HOSTILE TAKEOVER</b></li>
+            </ul>
+            <button className="btn" onClick={onCancel} style={{width:"100%",marginTop:18}}>► UNDERSTOOD</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return(
+    <div className="ov">
+      <div className="modal" style={{maxWidth:680}}>
+        <div className="modal-hdr" style={{borderColor:"var(--red)"}}>
+          <div>
+            <div className="modal-tag" style={{color:"var(--red)",borderColor:"var(--red)",background:"rgba(255,56,56,.1)"}}>⚠ HOSTILE ACTION</div>
+            <div className="modal-title">RAID {target.handle.toUpperCase()}</div>
+            <div className="modal-sub">Target zone: {zone} · Defender power est: {Math.round(raidDefenderPower(target,"smash_grab"))}</div>
+          </div>
+        </div>
+        <div className="modal-body">
+          <p style={{fontSize:13,color:"var(--txt-dim)",lineHeight:1.7,marginBottom:18}}>Pick your raid type. Each takes 1-2 days to resolve. The defender will be notified and can deploy crew to reinforce. Heat applies regardless of outcome.</p>
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {available.map(rt=>{
+              const power=raidAttackerPower(gameState,rt.id);
+              const defPower=raidDefenderPower(target,rt.id);
+              const oddsRaw=power/(power+defPower);
+              const oddsPct=Math.round(oddsRaw*100);
+              return(
+                <div key={rt.id} onClick={()=>setChosen(rt.id)} style={{padding:"14px 16px",border:"1px solid "+(chosen===rt.id?"var(--red)":"var(--line)"),background:chosen===rt.id?"rgba(255,56,56,.06)":"rgba(0,0,0,.20)",cursor:"pointer",transition:"all .15s"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+                    <div>
+                      <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:16,letterSpacing:2.5,color:"var(--red)"}}>{rt.icon} {rt.name}</div>
+                      <div style={{fontSize:11,color:"var(--txt-dim)",lineHeight:1.5,marginTop:4}}>{rt.desc}</div>
+                    </div>
+                    <div style={{textAlign:"right",marginLeft:14,minWidth:90}}>
+                      <div style={{fontSize:18,fontFamily:"'Bebas Neue',sans-serif",letterSpacing:2,color:oddsPct>=60?"var(--green)":oddsPct>=40?"var(--amber)":"var(--red)"}}>{oddsPct}%</div>
+                      <div style={{fontSize:9,color:"var(--txt-faint)",letterSpacing:.5,fontFamily:"'JetBrains Mono',monospace"}}>est. odds</div>
+                    </div>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginTop:10,paddingTop:10,borderTop:"1px solid var(--line)",fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--txt-faint)"}}>
+                    <span>Power: <b style={{color:"var(--cyan)"}}>{Math.round(power)}</b></span>
+                    <span>Heat: <b style={{color:"var(--red)"}}>+{rt.heatGenerated}</b></span>
+                    <span>Resolves: <b style={{color:"var(--amber)"}}>{rt.duration}d</b></span>
+                  </div>
+                  {chosen===rt.id&&(
+                    <div style={{fontSize:10.5,color:"var(--txt-dim)",marginTop:10,paddingTop:10,borderTop:"1px solid var(--line)",lineHeight:1.6}}>
+                      <b style={{color:"var(--green)"}}>If you win:</b> {rt.rewards}<br/>
+                      <b style={{color:"var(--red)"}}>If you lose:</b> {rt.failPenalty}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div style={{display:"flex",gap:10,marginTop:18}}>
+            <button className="btn" onClick={onCancel} style={{flex:1,background:"transparent",borderColor:"var(--txt-faint)",color:"var(--txt-faint)"}}>CANCEL</button>
+            <button className="btn" disabled={!chosen||submitting} onClick={()=>launch(chosen)} style={{flex:2,borderColor:"var(--red)",color:"var(--red)"}}>{submitting?"LAUNCHING...":"► LAUNCH RAID"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function IncomingRaidModal({raid,gameState,onDefend,onSurrender}){
+  const raidType=RAID_TYPES[raid.type];
+  const myDefense=Math.round(raidDefenderPower(gameState,raid.type));
+  const reinforcementCost=15000; // pay $15K to reinforce defense by +50%
+  const canReinforce=gameState.cash>=reinforcementCost;
+
+  return(
+    <div className="ov">
+      <div className="modal" style={{maxWidth:560}}>
+        <div className="modal-hdr" style={{borderColor:"var(--red)"}}>
+          <div>
+            <div className="modal-tag" style={{color:"var(--red)",borderColor:"var(--red)",background:"rgba(255,56,56,.10)"}}>🚨 INCOMING RAID</div>
+            <div className="modal-title">{raid.attackerHandle.toUpperCase()} IS HITTING YOU</div>
+            <div className="modal-sub">Type: {raidType.name} · Zone: {raid.zone} · Resolves in ~1 day</div>
+          </div>
+        </div>
+        <div className="modal-body">
+          <div style={{padding:"16px 18px",background:"rgba(255,56,56,.06)",borderLeft:"3px solid var(--red)",fontStyle:"italic",fontFamily:"'Special Elite',monospace",fontSize:13,lineHeight:1.7,color:"var(--red)",marginBottom:18}}>
+            {raid.attackerHandle} just launched a {raidType.name} against your {raid.zone} territory. They've committed crew and resources. You have time to reinforce defense before resolution.
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14,padding:"12px 14px",background:"rgba(0,0,0,.25)",border:"1px solid var(--line)"}}>
+            <div>
+              <div style={{fontSize:9,color:"var(--txt-faint)",letterSpacing:1,fontFamily:"'JetBrains Mono',monospace",marginBottom:2}}>THEIR ATTACK</div>
+              <div style={{fontSize:18,fontFamily:"'Bebas Neue',sans-serif",letterSpacing:2,color:"var(--red)"}}>{raid.attackerPower}</div>
+            </div>
+            <div>
+              <div style={{fontSize:9,color:"var(--txt-faint)",letterSpacing:1,fontFamily:"'JetBrains Mono',monospace",marginBottom:2}}>YOUR DEFENSE</div>
+              <div style={{fontSize:18,fontFamily:"'Bebas Neue',sans-serif",letterSpacing:2,color:"var(--green)"}}>{myDefense+(raid.defenderReinforcement||0)}</div>
+            </div>
+          </div>
+          <button className="btn" disabled={!canReinforce} onClick={()=>onDefend(reinforcementCost,Math.round(myDefense*0.5))} style={{width:"100%",marginBottom:8,padding:12,borderColor:"var(--green)",color:"var(--green)"}}>{canReinforce?`💪 REINFORCE DEFENSE · $${fmt(reinforcementCost)} · +${Math.round(myDefense*0.5)} power`:"NO CASH FOR REINFORCEMENT"}</button>
+          <button className="btn" onClick={onSurrender} style={{width:"100%",padding:10,background:"transparent",borderColor:"var(--txt-faint)",color:"var(--txt-faint)"}}>ACCEPT RAID · LET IT RESOLVE</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MultiplayerLobby({onJoinedLobby,onSkip}){
   const [mode,setMode]=useState("menu"); // menu | create | join | connecting
   const [handle,setHandle]=useState("");
